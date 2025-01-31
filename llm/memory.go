@@ -3,7 +3,6 @@ package llm
 import (
 	"fmt"
 	"log/slog"
-	"os"
 	"strconv"
 	"strings"
 
@@ -106,14 +105,6 @@ func EstimateGPULayers(gpus []discover.GpuInfo, ggml *GGML, projectors []string,
 	}
 	slog.Debug("evaluating", "library", gpus[0].Library, "gpu_count", len(gpus), "available", availableList)
 
-	for _, projector := range projectors {
-		weight, graph := projectorMemoryRequirements(projector)
-		projectorWeights += weight
-		projectorGraph += graph
-
-		// multimodal models require at least 2048 context
-		opts.NumCtx = max(opts.NumCtx, 2048)
-	}
 
 	layers := ggml.Tensors().Layers()
 	// add one layer worth of memory as a buffer
@@ -121,30 +112,6 @@ func EstimateGPULayers(gpus []discover.GpuInfo, ggml *GGML, projectors []string,
 		layerSize = blk0.size()
 	} else {
 		slog.Warn("model missing blk.0 layer size")
-	}
-
-	fa := envconfig.FlashAttention() &&
-		discover.GetGPUInfo().FlashAttentionSupported() &&
-		ggml.SupportsFlashAttention()
-
-	var kvct string
-	if fa {
-		requested := strings.ToLower(envconfig.KvCacheType())
-		if requested != "" && ggml.SupportsKVCacheType(requested) {
-			kvct = requested
-		}
-	}
-
-	kv, graphPartialOffload, graphFullOffload := ggml.GraphSize(uint64(opts.NumCtx), uint64(min(opts.NumCtx, opts.NumBatch)), kvct)
-
-	// KV is proportional to the number of layers
-	layerSize += kv / ggml.KV().BlockCount()
-
-	if graphPartialOffload == 0 {
-		graphPartialOffload = ggml.KV().GQA() * kv / 6
-	}
-	if graphFullOffload == 0 {
-		graphFullOffload = graphPartialOffload
 	}
 
 	// on metal there's no partial offload overhead
@@ -215,7 +182,6 @@ func EstimateGPULayers(gpus []discover.GpuInfo, ggml *GGML, projectors []string,
 		// Some models have inconsistent layer sizes
 		if blk, ok := layers[fmt.Sprintf("blk.%d", i)]; ok {
 			layerSize = blk.size()
-			layerSize += kv / ggml.KV().BlockCount()
 		}
 		memoryWeights += layerSize
 
@@ -313,7 +279,7 @@ func EstimateGPULayers(gpus []discover.GpuInfo, ggml *GGML, projectors []string,
 		layersRequested:     opts.NumGPU,
 		layersModel:         int(ggml.KV().BlockCount()) + 1,
 		availableList:       availableList,
-		kv:                  kv,
+		kv:                  0,
 		allocationsList:     allocationsList,
 		memoryWeights:       memoryWeights,
 		memoryLayerOutput:   memoryLayerOutput,
@@ -400,53 +366,4 @@ func (m MemoryEstimate) log() {
 			),
 		),
 	)
-}
-
-func projectorMemoryRequirements(filename string) (weights, graphSize uint64) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return 0, 0
-	}
-	defer file.Close()
-
-	ggml, _, err := DecodeGGML(file, 0)
-	if err != nil {
-		return 0, 0
-	}
-
-	for _, layer := range ggml.Tensors().Layers() {
-		weights += layer.size()
-	}
-
-	switch arch := ggml.KV().Architecture(); arch {
-	case "mllama":
-		kv := func(n string) uint64 {
-			if v, ok := ggml.KV()[arch+".vision."+n].(uint32); ok {
-				return uint64(v)
-			}
-
-			return 0
-		}
-
-		imageSize := kv("image_size")
-
-		maxNumTiles := kv("max_num_tiles")
-		embeddingLength := kv("embedding_length")
-		headCount := kv("attention.head_count")
-
-		numPatches := (imageSize / kv("patch_size")) * (imageSize / kv("patch_size"))
-		if _, ok := ggml.Tensors().Layers()["v"]["class_embd"]; ok {
-			numPatches++
-		}
-
-		numPaddedPatches := numPatches + 8 - (numPatches%8)%8
-
-		graphSize = 4 * (8 +
-			imageSize*imageSize*kv("num_channels")*maxNumTiles +
-			embeddingLength*numPatches*maxNumTiles +
-			9*embeddingLength*numPaddedPatches*maxNumTiles +
-			numPaddedPatches*maxNumTiles*numPaddedPatches*maxNumTiles*headCount)
-	}
-
-	return weights, graphSize
 }

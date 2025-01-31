@@ -187,11 +187,6 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					}
 
 					// Load model for fitting
-					ggml, err := llm.LoadModel(pending.model.ModelPath, 0)
-					if err != nil {
-						pending.errCh <- err
-						break
-					}
 
 					// Embedding models should always be loaded with parallel=1
 					if pending.model.CheckCapabilities(CapabilityCompletion) != nil {
@@ -207,30 +202,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 
 						pending.opts.NumCtx = pending.origNumCtx * numParallel
 
-						if loadedCount == 0 {
-							slog.Debug("cpu mode with first model, loading")
-							s.loadFn(pending, ggml, gpus, numParallel)
-							break
-						}
-						runnerToExpire = s.maybeFindCPURunnerToUnload(pending, ggml, gpus)
-						if runnerToExpire == nil {
-							slog.Debug("cpu mode with available system memory or first model, loading")
-							s.loadFn(pending, ggml, gpus, numParallel)
-							break
-						}
 						// else we need to expire a runner
-					} else if loadedCount == 0 {
-						// No models loaded. Load the model but prefer the best fit.
-						slog.Debug("loading first model", "model", pending.model.ModelPath)
-						g := pickBestFullFitByLibrary(pending, ggml, gpus, &numParallel)
-						if g != nil {
-							gpus = g
-						} else {
-							// Only allow partial loads when this is the first model
-							gpus = pickBestPartialFitByLibrary(pending, ggml, gpus, &numParallel)
-						}
-						s.loadFn(pending, ggml, gpus, numParallel)
-						break
 					}
 
 					if runnerToExpire == nil {
@@ -244,12 +216,6 @@ func (s *Scheduler) processPending(ctx context.Context) {
 
 						// Update free memory from currently loaded models
 						s.updateFreeSpace(availGpus)
-						fitGpus := pickBestFullFitByLibrary(pending, ggml, availGpus, &numParallel)
-						if fitGpus != nil {
-							slog.Debug("new model fits with existing models, loading")
-							s.loadFn(pending, ggml, fitGpus, numParallel)
-							break
-						}
 
 						// We couldn't find a set of GPUs to fully load the new
 						// model. If no other models are loading (both GPU lists

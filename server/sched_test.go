@@ -133,7 +133,6 @@ func newScenarioRequest(t *testing.T, ctx context.Context, modelName string, est
 
 	fname := f.Name()
 	model := &Model{Name: modelName, ModelPath: fname}
-	b.ggml, err = llm.LoadModel(model.ModelPath, 0)
 	require.NoError(t, err)
 
 	if duration == nil {
