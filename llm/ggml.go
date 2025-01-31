@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	"github.com/ollama/ollama/util/bufioutil"
 )
 
 type GGML struct {
@@ -314,7 +316,49 @@ func DetectGGMLType(b []byte) string {
 //
 // It collects array values for arrays with a size less than or equal to
 // maxArraySize. If maxArraySize is 0, the default value of 1024 is used. If
-// the maxArraySize is negative, all arrays are collected
+// the maxArraySize is negative, all arrays are collected.
+func DecodeGGML(rs io.ReadSeeker, maxArraySize int) (*GGML, int64, error) {
+	if maxArraySize == 0 {
+		maxArraySize = 1024
+	}
+
+	rs = bufioutil.NewBufferedSeeker(rs, 32<<10)
+
+	var magic uint32
+	if err := binary.Read(rs, binary.LittleEndian, &magic); err != nil {
+		return nil, 0, err
+	}
+
+	var c container
+	switch magic {
+	case FILE_MAGIC_GGML, FILE_MAGIC_GGMF, FILE_MAGIC_GGJT:
+		return nil, 0, ErrUnsupportedFormat
+	case FILE_MAGIC_GGLA:
+		c = &containerGGLA{}
+	case FILE_MAGIC_GGUF_LE:
+		c = &containerGGUF{ByteOrder: binary.LittleEndian, maxArraySize: maxArraySize}
+	case FILE_MAGIC_GGUF_BE:
+		c = &containerGGUF{ByteOrder: binary.BigEndian, maxArraySize: maxArraySize}
+	default:
+		return nil, 0, errors.New("invalid file magic")
+	}
+
+	model, err := c.Decode(rs)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	offset, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// final model type
+	return &GGML{
+		container: c,
+		model:     model,
+	}, offset, nil
+}
 
 func (llm GGML) GraphSize(context, batch uint64, kvCacheType string) (kv, partialOffload, fullOffload uint64) {
 	embedding := llm.KV().EmbeddingLength()
@@ -328,6 +372,8 @@ func (llm GGML) GraphSize(context, batch uint64, kvCacheType string) (kv, partia
 
 	layers := llm.Tensors().Layers()
 
+	bytesPerElement := kvCacheBytesPerElement(kvCacheType)
+	kv = uint64(float64(context*llm.KV().BlockCount()*(embeddingHeadsK+embeddingHeadsV)*headsKV) * bytesPerElement)
 
 	switch llm.KV().Architecture() {
 	case "llama":
@@ -481,4 +527,35 @@ func (llm GGML) GraphSize(context, batch uint64, kvCacheType string) (kv, partia
 	}
 
 	return
+}
+
+// SupportsKVCacheType checks if the requested cache type is supported
+func (ggml GGML) SupportsKVCacheType(cacheType string) bool {
+	validKVCacheTypes := []string{"f16", "q8_0", "q4_0"}
+	return slices.Contains(validKVCacheTypes, cacheType)
+}
+
+// SupportsFlashAttention checks if the model supports flash attention
+func (ggml GGML) SupportsFlashAttention() bool {
+	_, isEmbedding := ggml.KV()[fmt.Sprintf("%s.pooling_type", ggml.KV().Architecture())]
+	if isEmbedding {
+		return false
+	}
+
+	// Check head counts match and are non-zero
+	headCountK := ggml.KV().EmbeddingHeadCountK()
+	headCountV := ggml.KV().EmbeddingHeadCountV()
+	return headCountK != 0 && headCountV != 0 && headCountK == headCountV
+}
+
+// kvCacheBytesPerElement returns the number of bytes per element for a given KV cache type
+func kvCacheBytesPerElement(cacheType string) float64 {
+	switch cacheType {
+	case "q8_0":
+		return 1 // 1/2 of fp16
+	case "q4_0":
+		return 0.5 // 1/4 of fp16
+	default:
+		return 2 // f16 (default)
+	}
 }

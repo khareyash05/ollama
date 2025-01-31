@@ -64,6 +64,12 @@ func parseFromModel(ctx context.Context, name model.Name, fn func(api.ProgressRe
 			}
 			defer blob.Close()
 
+			ggml, _, err := llm.DecodeGGML(blob, 0)
+			if err != nil {
+				return nil, err
+			}
+
+			layers = append(layers, &layerGGML{layer, ggml})
 		default:
 			layers = append(layers, &layerGGML{layer, nil})
 		}

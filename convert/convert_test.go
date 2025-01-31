@@ -9,7 +9,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -25,6 +27,37 @@ type tensorData struct {
 	Offsets []int  `json:"data_offsets"`
 	Type    string `json:"dtype"`
 	Shape   []int  `json:"shape"`
+}
+
+func convertFull(t *testing.T, fsys fs.FS) (*os.File, llm.KV, *llm.Tensors) {
+	t.Helper()
+
+	f, err := os.CreateTemp(t.TempDir(), "f16")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if err := ConvertModel(fsys, f); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := os.Open(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+
+	m, _, err := llm.DecodeGGML(r, math.MaxInt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+
+	return r, m.KV(), m.Tensors()
 }
 
 func generateResultsJSON(t *testing.T, f *os.File, kv llm.KV, tensors *llm.Tensors) map[string]string {
@@ -91,6 +124,9 @@ func TestConvertModel(t *testing.T) {
 				t.Skipf("%s not found", p)
 			}
 
+			f, kv, tensors := convertFull(t, os.DirFS(p))
+			actual := generateResultsJSON(t, f, kv, tensors)
+
 			expectFile, err := os.Open(filepath.Join("testdata", fmt.Sprintf("%s.json", tt)))
 			if err != nil {
 				t.Fatal(err)
@@ -103,6 +139,13 @@ func TestConvertModel(t *testing.T) {
 
 			keys := maps.Keys(expect)
 			slices.Sort(keys)
+			for _, k := range keys {
+				if v, ok := actual[k]; !ok {
+					t.Errorf("missing %s", k)
+				} else if v != expect[k] {
+					t.Errorf("unexpected %s: want %s, got %s", k, expect[k], v)
+				}
+			}
 		})
 	}
 }
@@ -289,13 +332,26 @@ func TestConvertAdapter(t *testing.T) {
 			}
 			defer r.Close()
 
+			m, _, err := llm.DecodeGGML(r, math.MaxInt)
+			if err != nil {
+				t.Fatal(err)
+			}
+
 			if _, err := r.Seek(0, io.SeekStart); err != nil {
 				t.Fatal(err)
 			}
 
+			actual := generateResultsJSON(t, r, m.KV(), m.Tensors())
 
 			keys := maps.Keys(c.Expected)
 			slices.Sort(keys)
+			for _, k := range keys {
+				if v, ok := actual[k]; !ok {
+					t.Errorf("missing %s", k)
+				} else if v != c.Expected[k] {
+					t.Errorf("unexpected %s: want %s, got %s", k, c.Expected[k], v)
+				}
+			}
 		})
 	}
 }

@@ -18,8 +18,10 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/convert"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
+	"github.com/ollama/ollama/llama"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/types/errtypes"
@@ -145,6 +147,13 @@ func (s *Server) CreateHandler(c *gin.Context) {
 
 func convertModelFromFiles(files map[string]string, baseLayers []*layerGGML, isAdapter bool, fn func(resp api.ProgressResponse)) ([]*layerGGML, error) {
 	switch detectModelTypeFromFiles(files) {
+	case "safetensors":
+		layers, err := convertFromSafetensors(files, baseLayers, isAdapter, fn)
+		if err != nil {
+			slog.Error("error converting from safetensors", "error", err)
+			return nil, err
+		}
+		return layers, nil
 	case "gguf":
 		if len(files) == 0 {
 			return nil, errNoFilesProvided
@@ -206,6 +215,74 @@ func detectModelTypeFromFiles(files map[string]string) string {
 	return ""
 }
 
+func convertFromSafetensors(files map[string]string, baseLayers []*layerGGML, isAdapter bool, fn func(resp api.ProgressResponse)) ([]*layerGGML, error) {
+	tmpDir, err := os.MkdirTemp("", "ollama-safetensors")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	for fp, digest := range files {
+		blobPath, err := GetBlobsPath(digest)
+		if err != nil {
+			return nil, err
+		}
+		if err := createLink(blobPath, filepath.Join(tmpDir, fp)); err != nil {
+			return nil, err
+		}
+	}
+
+	t, err := os.CreateTemp(tmpDir, "fp16")
+	if err != nil {
+		return nil, err
+	}
+	defer t.Close()
+
+	var mediaType string
+	if !isAdapter {
+		fn(api.ProgressResponse{Status: "converting model"})
+		mediaType = "application/vnd.ollama.image.model"
+		if err := convert.ConvertModel(os.DirFS(tmpDir), t); err != nil {
+			return nil, err
+		}
+	} else {
+		kv, err := kvFromLayers(baseLayers)
+		if err != nil {
+			return nil, err
+		}
+		fn(api.ProgressResponse{Status: "converting adapter"})
+		mediaType = "application/vnd.ollama.image.adapter"
+		if err := convert.ConvertAdapter(os.DirFS(tmpDir), t, kv); err != nil {
+			return nil, err
+		}
+	}
+
+	if _, err := t.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	layer, err := NewLayer(t, mediaType)
+	if err != nil {
+		return nil, err
+	}
+
+	bin, err := layer.Open()
+	if err != nil {
+		return nil, err
+	}
+
+	ggml, _, err := llm.DecodeGGML(bin, 0)
+	if err != nil {
+		return nil, err
+	}
+	layers := []*layerGGML{{layer, ggml}}
+
+	if !isAdapter {
+		return detectChatTemplate(layers)
+	}
+	return layers, nil
+}
+
 func kvFromLayers(baseLayers []*layerGGML) (llm.KV, error) {
 	for _, l := range baseLayers {
 		if l.GGML != nil {
@@ -229,6 +306,7 @@ func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, 
 		if layer.GGML != nil {
 			quantType := strings.ToUpper(cmp.Or(r.Quantize, r.Quantization))
 			if quantType != "" && layer.GGML.Name() == "gguf" && layer.MediaType == "application/vnd.ollama.image.model" {
+				want, err := llm.ParseFileType(quantType)
 				if err != nil {
 					return err
 				}
@@ -236,6 +314,11 @@ func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, 
 				ft := layer.GGML.KV().FileType()
 				if !slices.Contains([]string{"F16", "F32"}, ft.String()) {
 					return errors.New("quantization is only supported for F16 and F32 models")
+				} else if ft != want {
+					layer, err = quantizeLayer(layer, quantType, fn)
+					if err != nil {
+						return err
+					}
 				}
 			}
 			config.ModelFormat = cmp.Or(config.ModelFormat, layer.GGML.Name())
@@ -316,6 +399,49 @@ func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, 
 	return nil
 }
 
+func quantizeLayer(layer *layerGGML, quantizeType string, fn func(resp api.ProgressResponse)) (*layerGGML, error) {
+	ft := layer.GGML.KV().FileType()
+	fn(api.ProgressResponse{Status: fmt.Sprintf("quantizing %s model to %s", ft, quantizeType)})
+
+	want, err := llm.ParseFileType(quantizeType)
+	if err != nil {
+		return nil, err
+	}
+
+	blob, err := GetBlobsPath(layer.Digest)
+	if err != nil {
+		return nil, err
+	}
+
+	temp, err := os.CreateTemp(filepath.Dir(blob), quantizeType)
+	if err != nil {
+		return nil, err
+	}
+	defer temp.Close()
+	defer os.Remove(temp.Name())
+
+	if err := llama.Quantize(blob, temp.Name(), uint32(want)); err != nil {
+		return nil, err
+	}
+
+	newLayer, err := NewLayer(temp, layer.MediaType)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := temp.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	ggml, _, err := llm.DecodeGGML(temp, 0)
+	if err != nil {
+		slog.Error(fmt.Sprintf("error decoding ggml: %s\n", err))
+		return nil, err
+	}
+
+	return &layerGGML{newLayer, ggml}, nil
+}
+
 func ggufLayers(digest string, fn func(resp api.ProgressResponse)) ([]*layerGGML, error) {
 	var layers []*layerGGML
 
@@ -349,11 +475,22 @@ func ggufLayers(digest string, fn func(resp api.ProgressResponse)) ([]*layerGGML
 
 	var offset int64
 	for offset < stat.Size() {
+		ggml, n, err := llm.DecodeGGML(blob, 0)
+		if errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return nil, err
+		}
 
 		mediatype := "application/vnd.ollama.image.model"
+		if ggml.KV().Kind() == "adapter" {
+			mediatype = "application/vnd.ollama.image.adapter"
+		} else if _, ok := ggml.KV()[fmt.Sprintf("%s.vision.block_count", ggml.KV().Architecture())]; ok || ggml.KV().Kind() == "projector" {
+			mediatype = "application/vnd.ollama.image.projector"
+		}
 
 		var layer Layer
-		if digest != "" && offset == 0 {
+		if digest != "" && n == stat.Size() && offset == 0 {
 			layer, err = NewLayerFromLayer(digest, mediatype, blob.Name())
 			if err != nil {
 				slog.Debug("could not create new layer from layer", "error", err)
@@ -363,12 +500,14 @@ func ggufLayers(digest string, fn func(resp api.ProgressResponse)) ([]*layerGGML
 
 		// Fallback to creating layer from file copy (either NewLayerFromLayer failed, or digest empty/n != stat.Size())
 		if layer.Digest == "" {
-			layer, err = NewLayer(io.NewSectionReader(blob, offset, 1), mediatype)
+			layer, err = NewLayer(io.NewSectionReader(blob, offset, n), mediatype)
 			if err != nil {
 				return nil, err
 			}
 		}
 
+		layers = append(layers, &layerGGML{layer, ggml})
+		offset = n
 	}
 
 	return detectChatTemplate(layers)

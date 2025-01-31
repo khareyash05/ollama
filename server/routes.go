@@ -379,6 +379,11 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
+	truncate := true
+
+	if req.Truncate != nil && !*req.Truncate {
+		truncate = false
+	}
 
 	var input []string
 
@@ -408,7 +413,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
-	r, _, _, err := s.scheduleRunner(c.Request.Context(), name.String(), []Capability{}, req.Options, req.KeepAlive)
+	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), []Capability{}, req.Options, req.KeepAlive)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
 		return
@@ -421,6 +426,12 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
+	kvData, err := getKVData(m.ModelPath, false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	var count int
 	for i, s := range input {
 		tokens, err := r.Tokenize(c.Request.Context(), s)
@@ -429,6 +440,20 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 			return
 		}
 
+		ctxLen := min(opts.NumCtx, int(kvData.ContextLength()))
+		if len(tokens) > ctxLen {
+			if !truncate {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "input length exceeds maximum context length"})
+				return
+			}
+
+			tokens = tokens[:ctxLen]
+			s, err = r.Detokenize(c.Request.Context(), tokens)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+		}
 
 		count += len(tokens)
 
@@ -814,9 +839,48 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 	fmt.Fprintln(&sb, "# To build a new Modelfile based on this, replace FROM with:")
 	fmt.Fprintf(&sb, "# FROM %s\n\n", m.ShortName)
 	fmt.Fprint(&sb, m.String())
+	resp.Modelfile = sb.String()
 
+	kvData, err := getKVData(m.ModelPath, req.Verbose)
+	if err != nil {
+		return nil, err
+	}
+	delete(kvData, "general.name")
+	delete(kvData, "tokenizer.chat_template")
+	resp.ModelInfo = kvData
+
+	if len(m.ProjectorPaths) > 0 {
+		projectorData, err := getKVData(m.ProjectorPaths[0], req.Verbose)
+		if err != nil {
+			return nil, err
+		}
+		resp.ProjectorInfo = projectorData
+	}
 
 	return resp, nil
+}
+
+func getKVData(digest string, verbose bool) (llm.KV, error) {
+	maxArraySize := 0
+	if verbose {
+		maxArraySize = -1
+	}
+	kvData, err := llm.LoadModel(digest, maxArraySize)
+	if err != nil {
+		return nil, err
+	}
+
+	kv := kvData.KV()
+
+	if !verbose {
+		for k := range kv {
+			if t, ok := kv[k].([]any); len(t) > 5 && ok {
+				kv[k] = []any{}
+			}
+		}
+	}
+
+	return kv, nil
 }
 
 func (s *Server) ListHandler(c *gin.Context) {

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/discover"
 )
 
@@ -44,12 +45,24 @@ func TestEstimateGPULayers(t *testing.T) {
 	}, tensors)
 	require.NoError(t, err)
 
+	ggml, err := LoadModel(f.Name(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// Simple CPU scenario
 	gpus := []discover.GpuInfo{
 		{
 			Library: "cpu",
 		},
 	}
+	projectors := []string{}
+	opts := api.DefaultOptions()
+	t.Run("cpu", func(t *testing.T) {
+		estimate := EstimateGPULayers(gpus, ggml, projectors, opts)
+		assert.Equal(t, 0, estimate.Layers)
+		assert.Equal(t, uint64(0), estimate.Graph)
+	})
 
 	// derived from the dummy ggml file above
 	graphPartialOffload := uint64(202377216)
@@ -71,7 +84,7 @@ func TestEstimateGPULayers(t *testing.T) {
 		},
 	}
 	// Nested array: GPU0 layer space, GPU1 layer space, expected gpu0, expected gpu1
-	for _, s := range []struct {
+	for i, s := range []struct {
 		layer0, layer1   uint64
 		expect0, expect1 uint64
 	}{
@@ -97,6 +110,20 @@ func TestEstimateGPULayers(t *testing.T) {
 			gpus[1].FreeMemory += gpuMinimumMemory + layerSize + s.layer1*layerSize + 1
 			gpus[0].FreeMemory += max(graphFullOffload, graphPartialOffload)
 			gpus[1].FreeMemory += max(graphFullOffload, graphPartialOffload)
+			estimate := EstimateGPULayers(gpus, ggml, projectors, opts)
+			assert.Equal(t, int(s.expect0+s.expect1), estimate.Layers, "scenario %d: %v", i, s)
+			assert.Equal(t, fmt.Sprintf("%d,%d", s.expect0, s.expect1), estimate.TensorSplit, "scenario %d: %v", i, s)
+			var layerSums uint64
+			for _, b := range estimate.GPUSizes {
+				layerSums += b
+			}
+			if estimate.Layers < inputLayerCount+1 {
+				assert.Less(t, estimate.VRAMSize, estimate.TotalSize, "scenario %d: %v %+v", i, s, estimate)
+				assert.Equal(t, estimate.VRAMSize, layerSums, "scenario %d: %v %+v", i, s, estimate)
+			} else {
+				assert.Equal(t, estimate.VRAMSize, estimate.TotalSize, "scenario %d: %v %+v", i, s, estimate)
+				assert.Equal(t, estimate.TotalSize, layerSums, "scenario %d: %v %+v", i, s, estimate)
+			}
 		})
 	}
 }

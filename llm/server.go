@@ -71,6 +71,20 @@ type llmServer struct {
 // It collects array values for arrays with a size less than or equal to
 // maxArraySize. If maxArraySize is 0, the default value of 1024 is used. If
 // the maxArraySize is negative, all arrays are collected.
+func LoadModel(model string, maxArraySize int) (*GGML, error) {
+	if _, err := os.Stat(model); err != nil {
+		return nil, err
+	}
+
+	f, err := os.Open(model)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	ggml, _, err := DecodeGGML(f, maxArraySize)
+	return ggml, err
+}
 
 // NewLlamaServer will run a server for the given GPUs
 // The gpu list must be a single family.
@@ -161,6 +175,10 @@ func NewLlamaServer(gpus discover.GpuInfoList, model string, ggml *GGML, adapter
 		fa = false
 	}
 
+	if fa && !ggml.SupportsFlashAttention() {
+		slog.Warn("flash attention enabled but not supported by model")
+		fa = false
+	}
 
 	kvct := strings.ToLower(envconfig.KvCacheType())
 
@@ -169,6 +187,12 @@ func NewLlamaServer(gpus discover.GpuInfoList, model string, ggml *GGML, adapter
 		params = append(params, "--flash-attn")
 
 		// Flash Attention also supports kv cache quantization
+		// Enable if the requested and kv cache type is supported by the model
+		if kvct != "" && ggml.SupportsKVCacheType(kvct) {
+			params = append(params, "--kv-cache-type", kvct)
+		} else {
+			slog.Warn("kv cache type not supported by model", "type", kvct)
+		}
 	} else if kvct != "" && kvct != "f16" {
 		slog.Warn("quantized kv cache requested but flash attention disabled", "type", kvct)
 	}
